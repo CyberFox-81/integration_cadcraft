@@ -1,0 +1,293 @@
+diff --git a/apps/cadcraft-web/Cargo.toml b/apps/cadcraft-web/Cargo.toml
+index c3a8c2b..5b6a2e8 100644
+--- a/apps/cadcraft-web/Cargo.toml
++++ b/apps/cadcraft-web/Cargo.toml
+@@ -29,4 +29,4 @@ web-sys = { version = "0.3", features = ["HtmlInputElement", "FileList", "File"]
+ eframe = { workspace = true, features = ["persistence", "default_fonts", "wgpu", "accesskit"] }
+ wasm-bindgen = "0.2"
+ wasm-bindgen-futures = "0.4"
+-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "HtmlCanvasElement", "HtmlAnchorElement", "Location", "Navigator", "Blob", "BlobPropertyBag", "Url"] }
++web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "HtmlCanvasElement", "HtmlAnchorElement", "Location", "Navigator", "Blob", "BlobPropertyBag", "Url", "MessageEvent", "UrlSearchParams"] }
+diff --git a/apps/cadcraft-web/src/host.rs b/apps/cadcraft-web/src/host.rs
+new file mode 100644
+index 0000000..8ac9f1a
+--- /dev/null
++++ b/apps/cadcraft-web/src/host.rs
+@@ -0,0 +1,140 @@
++//! The `postMessage` bridge to a same-origin parent page (`?host=parent`), for pages that embed
++//! CADCraft in an `<iframe>` (such as a Nextcloud app). Messages are plain objects with a `type`:
++//!
++//! - `cadcraft:ready` (to the parent): `{ version }`, the app is listening; send a drawing now.
++//! - `cadcraft:open` (from the parent): `{ name, bytes }`, bytes an `ArrayBuffer` or
++//!   `Uint8Array`. It opens like a file picked with File › Open or dropped on the window.
++//! - `cadcraft:save` (to the parent): `{ name, bytes }` (a transferred `ArrayBuffer`) for every
++//!   file CADCraft would otherwise download (SAVE, SAVEAS, exports): it replaces the engine's
++//!   delivery hook. The parent stores the file and reports failures itself.
++//! - `cadcraft:dirty` (to the parent): `{ dirty }` whenever unsaved changes appear or go away.
++//! - `cadcraft:failed` (to the parent): `{ error }` when the app couldn't start.
++//!
++//! Only the parent window on the page's own origin is heard or answered. In host mode the app
++//! starts on the Start tab rather than an empty Drawing1, and the parent guards leaving the page.
++
++use std::cell::{Cell, RefCell};
++
++use cadcraft_ui_egui::CadApp;
++use wasm_bindgen::JsCast as _;
++use wasm_bindgen::JsValue;
++use wasm_bindgen::closure::Closure;
++use web_sys::js_sys;
++
++thread_local! {
++    /// The bridge [`deliver`] posts through (the engine's hook is a plain `fn`).
++    static BRIDGE: RefCell<Option<Bridge>> = const { RefCell::new(None) };
++}
++
++#[derive(Clone)]
++pub struct Bridge {
++    window: web_sys::Window,
++    parent: web_sys::Window,
++    origin: String,
++}
++
++/// The unsaved-changes state last reported to the parent.
++#[derive(Default)]
++pub struct DirtyReport(Cell<Option<bool>>);
++
++impl Bridge {
++    /// `None` when the page isn't framed (there is no parent to talk to).
++    pub fn new() -> Option<Self> {
++        let window = web_sys::window()?;
++        let parent = window.parent().ok().flatten()?;
++        if js_sys::Object::is(&parent, &window) {
++            return None;
++        }
++        let origin = window.location().origin().ok()?;
++        Some(Self { window, parent, origin })
++    }
++
++    /// Make this the bridge [`deliver`] uses.
++    pub fn install(&self) {
++        BRIDGE.with(|b| *b.borrow_mut() = Some(self.clone()));
++    }
++
++    pub fn post_ready(&self) {
++        self.send(&[("type", "cadcraft:ready".into()), ("version", env!("CARGO_PKG_VERSION").into())]);
++    }
++
++    pub fn post_failed(&self, error: &str) {
++        self.send(&[("type", "cadcraft:failed".into()), ("error", error.into())]);
++    }
++
++    /// Hear drawings from the parent; they arrive through the upload inbox.
++    pub fn listen(&self, inbox: crate::upload::Inbox) {
++        let parent = self.parent.clone();
++        let origin = self.origin.clone();
++        let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
++            if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
++                return;
++            }
++            let data = event.data();
++            if string(&data, "type").as_deref() != Some("cadcraft:open") {
++                return;
++            }
++            let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Drawing.dxf".to_string());
++            if let Some(bytes) = bytes(&data) {
++                inbox.receive(name, bytes);
++            }
++        });
++        if self.window.add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref()).is_ok() {
++            // The listener lives as long as the page.
++            on_message.forget();
++        }
++    }
++
++    /// After each frame: tell the parent when unsaved changes appear or go away.
++    pub fn report_dirty(&self, app: &CadApp, reported: &DirtyReport) {
++        let dirty = app.session.docs.iter().any(|d| d.is_dirty());
++        if reported.0.get() != Some(dirty) && self.send(&[("type", "cadcraft:dirty".into()), ("dirty", dirty.into())]) {
++            reported.0.set(Some(dirty));
++        }
++    }
++
++    fn post_save(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
++        let buffer = js_sys::Uint8Array::from(bytes).buffer();
++        let message = message(&[("type", "cadcraft:save".into()), ("name", name.into()), ("bytes", buffer.clone().into())])
++            .ok_or_else(|| "couldn't build the message".to_string())?;
++        self.parent
++            .post_message_with_transfer(&message, &self.origin, &js_sys::Array::of1(&buffer))
++            .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))
++    }
++
++    /// Post a message to the parent; false if it couldn't be sent.
++    fn send(&self, fields: &[(&str, JsValue)]) -> bool {
++        message(fields).is_some_and(|m| self.parent.post_message(&m, &self.origin).is_ok())
++    }
++}
++
++/// The engine's delivery hook in host mode ([`cadcraft_engine::cmd::file::set_deliver`]): hand
++/// the file to the parent page. `Ok` once it was posted; the engine then counts a drawing as saved.
++pub fn deliver(name: &str, _mime: &str, bytes: &[u8]) -> Result<(), String> {
++    let bridge = BRIDGE.with(|b| b.borrow().clone()).ok_or("the page that embeds CADCraft is gone")?;
++    bridge.post_save(name, bytes)
++}
++
++fn message(fields: &[(&str, JsValue)]) -> Option<js_sys::Object> {
++    let m = js_sys::Object::new();
++    for (key, value) in fields {
++        js_sys::Reflect::set(&m, &JsValue::from_str(key), value).ok()?;
++    }
++    Some(m)
++}
++
++fn string(data: &JsValue, key: &str) -> Option<String> {
++    js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?.as_string()
++}
++
++/// `bytes` as an `ArrayBuffer` or `Uint8Array`.
++fn bytes(data: &JsValue) -> Option<Vec<u8>> {
++    let bytes = js_sys::Reflect::get(data, &JsValue::from_str("bytes")).ok()?;
++    if let Some(array) = bytes.dyn_ref::<js_sys::Uint8Array>() {
++        Some(array.to_vec())
++    } else if bytes.is_instance_of::<js_sys::ArrayBuffer>() {
++        Some(js_sys::Uint8Array::new(&bytes).to_vec())
++    } else {
++        None
++    }
++}
+diff --git a/apps/cadcraft-web/src/main.rs b/apps/cadcraft-web/src/main.rs
+index 277faf6..48c33c6 100644
+--- a/apps/cadcraft-web/src/main.rs
++++ b/apps/cadcraft-web/src/main.rs
+@@ -3,11 +3,15 @@
+ //! Runs the same [`cadcraft_ui_egui::CadApp`] as the desktop app through eframe's web runner
+ //! (wgpu: WebGPU where available, WebGL2 otherwise). Build with `trunk build --release` from this
+ //! directory (output in `dist/web`). URL flags: `?webgl` forces WebGL2, `?sample` opens the sample
+-//! drawing. Saving downloads the drawing through the browser (`download.rs`).
++//! drawing. Saving downloads the drawing through the browser (`download.rs`). With `?host=parent`
++//! (inside an `<iframe>`), a same-origin parent page sends the drawing to open and stores what
++//! CADCraft saves instead (`host.rs`).
+ #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+ 
+ #[cfg(target_arch = "wasm32")]
+ pub mod download;
++#[cfg(target_arch = "wasm32")]
++mod host;
+ 
+ #[cfg(target_arch = "wasm32")]
+ mod web {
+@@ -18,14 +22,18 @@ mod web {
+     const CANVAS_ID: &str = "cadcraft_canvas";
+     const LOADING_ID: &str = "cadcraft_loading";
+ 
+-    /// The app, and the files File > Open… and drag and drop read for it in the background.
+-    struct Shell(CadApp, crate::upload::Inbox);
++    /// The app, the files File > Open… and drag and drop read for it in the background, and the
++    /// page embedding it (`?host=parent`).
++    struct Shell(CadApp, crate::upload::Inbox, Option<(crate::host::Bridge, crate::host::DirtyReport)>);
+ 
+     impl eframe::App for Shell {
+         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+             self.1.take_dropped(ctx);
+             self.1.drain(&mut self.0);
+             self.0.logic(ctx);
++            if let Some((bridge, reported)) = &self.2 {
++                bridge.report_dirty(&self.0, reported);
++            }
+         }
+         fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+             self.0.raw_input_hook(raw);
+@@ -40,6 +48,9 @@ mod web {
+         }
+         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+             self.0.ui(ui);
++            if let Some((bridge, reported)) = &self.2 {
++                bridge.report_dirty(&self.0, reported);
++            }
+         }
+     }
+ 
+@@ -47,6 +58,10 @@ mod web {
+         web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
+     }
+ 
++    fn query_param(key: &str) -> Option<String> {
++        web_sys::UrlSearchParams::new_with_str(&query()).ok()?.get(key)
++    }
++
+     /// No file picker on the web: Save / Save As from the menu (and the close prompt) download the
+     /// drawing under its current name; `saveas {"path": "name.dxf"}` picks another name.
+     fn services() -> Services {
+@@ -60,9 +75,19 @@ mod web {
+             write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
+             plot: Some(|d, space, opts| cadcraft_io::plot(d, space, opts).map_err(|e| e.to_string())),
+         });
+-        // No file system here: saved files reach the user as browser downloads.
+-        cadcraft_engine::cmd::file::set_deliver(crate::download::download);
+-        wasm_bindgen_futures::spawn_local(async {
++        // `?host=parent`: a same-origin page framing CADCraft (such as a Nextcloud app) opens
++        // drawings in it and stores what it saves. Otherwise there is no file system here: saved
++        // files reach the user as browser downloads.
++        let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
++        match &bridge {
++            Some(bridge) => {
++                bridge.install();
++                cadcraft_engine::cmd::file::set_deliver(crate::host::deliver);
++            }
++            None => cadcraft_engine::cmd::file::set_deliver(crate::download::download),
++        }
++        let app_bridge = bridge.clone();
++        wasm_bindgen_futures::spawn_local(async move {
+             let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
+             let Some(canvas) = document.get_element_by_id(CANVAS_ID).and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok()) else {
+                 log::error!("missing <canvas id=\"{CANVAS_ID}\">");
+@@ -79,7 +104,9 @@ mod web {
+                     canvas,
+                     options,
+                     Box::new(move |cc| {
+-                        let mut app = CadApp::new(Session::new(), services());
++                        // Embedded, the parent sends the drawing: start on the Start tab, not Drawing1.
++                        let session = if app_bridge.is_some() { Session::empty() } else { Session::new() };
++                        let mut app = CadApp::new(session, services());
+                         app.system_languages =
+                             web_sys::window().map(|w| w.navigator().languages().iter().filter_map(|v| v.as_string()).collect()).unwrap_or_default();
+                         if let Some(prefs) = cc.storage.and_then(|s| s.get_string(cadcraft_ui_egui::PREFS_KEY)) {
+@@ -99,10 +126,18 @@ mod web {
+                             picker.pick();
+                             None
+                         }));
+-                        Ok(Box::new(Shell(app, inbox)))
++                        let host = app_bridge.map(|bridge| {
++                            bridge.listen(inbox.clone());
++                            bridge.post_ready();
++                            (bridge, crate::host::DirtyReport::default())
++                        });
++                        Ok(Box::new(Shell(app, inbox, host)))
+                     }),
+                 )
+                 .await;
++            if let (Err(e), Some(bridge)) = (&result, &bridge) {
++                bridge.post_failed(&format!("{e:?}"));
++            }
+             if let Some(el) = document.get_element_by_id(LOADING_ID) {
+                 match result {
+                     Ok(()) => el.remove(),
+diff --git a/apps/cadcraft-web/src/upload.rs b/apps/cadcraft-web/src/upload.rs
+index d2edce7..687ec40 100644
+--- a/apps/cadcraft-web/src/upload.rs
++++ b/apps/cadcraft-web/src/upload.rs
+@@ -96,6 +96,15 @@ impl Inbox {
+         });
+     }
+ 
++    /// A file read elsewhere (sent by the page embedding CADCraft): opened on the next frame like
++    /// a picked file, or refused when too large to open.
++    pub fn receive(&self, name: String, bytes: Vec<u8>) {
++        match CadApp::open_size_error(&name, bytes.len() as u64) {
++            Some(e) => self.push(Err(e)),
++            None => self.push(Ok((name, bytes))),
++        }
++    }
++
+     fn push(&self, upload: Upload) {
+         let mut files = self.files.take();
+         files.push(upload);
