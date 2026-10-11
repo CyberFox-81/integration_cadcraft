@@ -7,3 +7,5 @@ web/boot.js
 web/cadcraft-web-*
 web/CADCRAFT-*
 web/snippets/
+web/build-*/
+web/build.txt
