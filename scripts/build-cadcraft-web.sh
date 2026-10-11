@@ -23,7 +23,7 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CADCRAFT_REF="${CADCRAFT_REF:-fc4220e9b7d7cc8e9d26704ccf0078d94caaa6c0}"
+CADCRAFT_REF="${CADCRAFT_REF:-699dd1aeca1dba018931d2eb95e92c0cf2033bbd}"
 SRC="${1:-$APP_DIR/build/cadcraft}"
 PATCH="$APP_DIR/patches/cadcraft-nextcloud.patch"
 OUT="$APP_DIR/web"
