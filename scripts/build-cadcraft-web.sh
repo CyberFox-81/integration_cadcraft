@@ -23,7 +23,7 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CADCRAFT_REF="${CADCRAFT_REF:-699dd1aeca1dba018931d2eb95e92c0cf2033bbd}"
+CADCRAFT_REF="${CADCRAFT_REF:-c57879a5c8f5e3a6be574a820add5e28eb25e9b1}"
 SRC="${1:-$APP_DIR/build/cadcraft}"
 PATCH="$APP_DIR/patches/cadcraft-nextcloud.patch"
 OUT="$APP_DIR/web"
@@ -35,9 +35,12 @@ if [ ! -e "$SRC/.git" ]; then
 fi
 
 if grep -rq 'cadcraft:ready' "$SRC/apps/cadcraft-web/src"; then
-	echo "bridge patch already applied"
-else
+	echo "CADCraft has the embedding bridge"
+elif [ -s "$PATCH" ]; then
 	git -C "$SRC" apply "$PATCH"
+else
+	echo "error: this CADCraft has no embedding bridge, and there is no patch to add it" >&2
+	exit 1
 fi
 
 cargo_args=(build --profile release -p cadcraft-web --target wasm32-unknown-unknown)

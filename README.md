@@ -48,13 +48,13 @@ Files ── "Edit in CADCraft" ──▶ /apps/integration_cadcraft/edit/{fileI
 
 The editor page downloads the file over WebDAV and passes it to CADCraft with `postMessage`. When you save, CADCraft passes the bytes back and the page uploads them with `If-Match`, so a newer version on the server is never overwritten without asking. A save in a format the opened file isn't in, and an export, ask for a name and folder with Nextcloud's own folder picker the first time; later saves under the same name go to the same file. The frame page is the only one whose Content Security Policy allows compiling WebAssembly.
 
-CADCraft's browser build saves by downloading a file. `patches/cadcraft-nextcloud.patch` adds an opt-in embedding bridge (`?host=parent`) to its web shell; the protocol is in [web/README.md](web/README.md). It is meant to be proposed upstream, so a future official CADCraft build can be used as is.
+CADCraft has the opt-in embedding bridge (`?host=parent`) this app uses since [storytold/cadcraft#509](https://github.com/storytold/cadcraft/pull/509), so the official CADCraft build is used as is; the protocol is in [web/README.md](web/README.md).
 
 ## Build from source
 
 ```sh
 make js      # npm ci && vite build → js/
-make wasm    # clone CADCraft, apply the patch, build → web/   (needs Rust, see below)
+make wasm    # clone CADCraft, build → web/   (needs Rust, see below)
 make dist    # → build/dist/integration_cadcraft-<version>.tar.gz
 ```
 
