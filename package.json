@@ -1,6 +1,6 @@
 {
   "name": "integration_cadcraft",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Open and edit DXF and DWG drawings in Nextcloud with CADCraft",
   "license": "AGPL-3.0-or-later",
